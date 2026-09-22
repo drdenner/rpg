@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="da">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<link rel="manifest" href="manifest.json">
+<title>Tegneapp</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    overscroll-behavior: none;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #2b2d31;
+  }
+
+  #toolbar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 16px;
+    background: #1f2023;
+    color: #eee;
+    z-index: 10;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  #toolbar h1 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+    margin-right: auto;
+    color: #bbb;
+    letter-spacing: 0.02em;
+  }
+
+  #toolbar button {
+    background: #3a3c40;
+    color: #eee;
+    border: 1px solid #55585e;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #toolbar button:hover { background: #4a4d52; }
+  #toolbar button:active { background: #2f3134; }
+
+  #toolbar .size-info {
+    font-size: 12px;
+    color: #999;
+    min-width: 110px;
+  }
+
+  /* Scrollbar container: lets the user navigate when the canvas grows
+     beyond the viewport. */
+  #canvas-wrap {
+    position: absolute;
+    top: 48px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    overflow: auto;
+    background: #45474c;
+  }
+
+  #canvas-pad {
+    display: inline-block;
+    padding: 60px;
+  }
+
+  #draw-canvas {
+    display: block;
+    background: #ffffff;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.15), 0 4px 18px rgba(0,0,0,0.35);
+    /* Critical for palm rejection / stylus use: stop the browser's own
+       scroll/zoom/pan gestures from intercepting pointer input on the canvas. */
+    touch-action: none;
+    -ms-touch-action: none;
+    cursor: crosshair;
+  }
+</style>
+</head>
+
+
+
+<body>
+
+  <div id="toolbar">
+    <h1>Tegneapp</h1>
+    <span class="size-info" id="size-info"></span>
+    <button id="clear-btn" type="button">Ryd</button>
+  </div>
+
+  <div id="canvas-wrap">
+    <div id="canvas-pad">
+      <canvas id="draw-canvas"></canvas>
+    </div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- Config ------------------------------------------------------------
+  var START_WIDTH = 1200;
+  var START_HEIGHT = 800;
+  var EDGE_MARGIN = 60;     // px (CSS) from an edge that triggers growth
+  var GROW_CHUNK = 400;     // px (CSS) added per growth step
+  var STROKE_COLOR = '#111111';
+  var BASE_WIDTH = 3;       // fixed width for mouse / touch / pressure-less input
+  var PEN_MIN_WIDTH = 1;
+  var PEN_MAX_WIDTH = 9;
+
+  // ---- Elements ------------------------------------------------------------
+  var wrap = document.getElementById('canvas-wrap');
+  var canvas = document.getElementById('draw-canvas');
+  var ctx = canvas.getContext('2d');
+  var sizeInfo = document.getElementById('size-info');
+  var clearBtn = document.getElementById('clear-btn');
+
+  // ---- Canvas state (logical size in CSS pixels) ----------------------------
+  var logicalWidth = START_WIDTH;
+  var logicalHeight = START_HEIGHT;
+  var dpr = 1;
+
+  function setCanvasPixelSize() {
+    dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(logicalWidth * dpr);
+    canvas.height = Math.round(logicalHeight * dpr);
+    canvas.style.width = logicalWidth + 'px';
+    canvas.style.height = logicalHeight + 'px';
+
+    // Resizing the backing store resets all context state, so reconfigure it.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = STROKE_COLOR;
+    ctx.fillStyle = STROKE_COLOR;
+
+    sizeInfo.textContent = logicalWidth + ' × ' + logicalHeight + ' px';
+  }
+
+  setCanvasPixelSize();
+
+  // Keep the backing store sharp if the window moves to a display with a
+  // different device pixel ratio (e.g. dragging between monitors).
+  function watchDpr() {
+    var media = window.matchMedia('(resolution: ' + (window.devicePixelRatio || 1) + 'dppx)');
+    function onChange() {
+      resamplePreservingContent(function () { setCanvasPixelSize(); });
+      watchDpr();
+    }
+    if (media.addEventListener) media.addEventListener('change', onChange, { once: true });
+    else if (media.addListener) media.addListener(onChange);
+  }
+  watchDpr();
+
+  // ---- Growing the canvas without losing existing drawing --------------------
+  // Copies the current bitmap into a same-size temp canvas, resizes the real
+  // canvas (which clears it), then draws the old content back at an offset so
+  // nothing shifts, is cropped, or is deleted.
+  function resamplePreservingContent(resizeFn) {
+    var temp = document.createElement('canvas');
+    temp.width = canvas.width;
+    temp.height = canvas.height;
+    temp.getContext('2d').drawImage(canvas, 0, 0);
+    var oldWidthCss = logicalWidth;
+    var oldHeightCss = logicalHeight;
+
+    resizeFn();
+
+    ctx.drawImage(temp, 0, 0, temp.width, temp.height, 0, 0, oldWidthCss, oldHeightCss);
+  }
+
+  function growCanvas(left, right, top, bottom) {
+    var temp = document.createElement('canvas');
+    temp.width = canvas.width;
+    temp.height = canvas.height;
+    temp.getContext('2d').drawImage(canvas, 0, 0);
+    var oldWidthCss = logicalWidth;
+    var oldHeightCss = logicalHeight;
+
+    logicalWidth += left + right;
+    logicalHeight += top + bottom;
+    setCanvasPixelSize();
+
+    // Old content is redrawn shifted right/down by however much we grew on
+    // the left/top, so its position inside the (now bigger) canvas is
+    // unchanged relative to its original edges.
+    ctx.drawImage(temp, 0, 0, temp.width, temp.height, left, top, oldWidthCss, oldHeightCss);
+
+    // Compensate scroll so growth on the left/top doesn't visually shift the
+    // drawing the user is currently looking at.
+    if (left) wrap.scrollLeft += left;
+    if (top) wrap.scrollTop += top;
+  }
+
+  // Returns how much was grown on the left/top (needed to correct any
+  // already-recorded point in the current stroke), or {dx:0, dy:0}.
+  function growCanvasIfNeeded(x, y) {
+    var left = 0, right = 0, top = 0, bottom = 0;
+
+    if (x < EDGE_MARGIN) left = Math.ceil(EDGE_MARGIN - x) + GROW_CHUNK;
+    if (x > logicalWidth - EDGE_MARGIN) right = Math.ceil(x - (logicalWidth - EDGE_MARGIN)) + GROW_CHUNK;
+    if (y < EDGE_MARGIN) top = Math.ceil(EDGE_MARGIN - y) + GROW_CHUNK;
+    if (y > logicalHeight - EDGE_MARGIN) bottom = Math.ceil(y - (logicalHeight - EDGE_MARGIN)) + GROW_CHUNK;
+
+    if (!left && !right && !top && !bottom) return { dx: 0, dy: 0 };
+
+    growCanvas(left, right, top, bottom);
+    return { dx: left, dy: top };
+  }
+
+  // ---- Drawing ---------------------------------------------------------------
+  function drawSegment(x0, y0, x1, y1, width) {
+    ctx.beginPath();
+    ctx.lineWidth = width;
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+  }
+
+  function drawDot(x, y, width) {
+    ctx.beginPath();
+    ctx.arc(x, y, width / 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function computeWidth(ev) {
+    if (ev.pointerType === 'pen' && typeof ev.pressure === 'number' && ev.pressure > 0) {
+      return PEN_MIN_WIDTH + ev.pressure * (PEN_MAX_WIDTH - PEN_MIN_WIDTH);
+    }
+    return BASE_WIDTH;
+  }
+
+  // ---- Pointer handling / palm rejection --------------------------------------
+  // Only one pointer draws at a time. While a pen is in contact, any touch
+  // pointer is fully ignored (palm resting on the screen), and if a touch
+  // stroke happens to be active when the pen touches down, it's cancelled.
+  var currentPointerId = null;
+  var currentPointerType = null;
+  var penActive = false;
+  var lastPoint = null;
+  var lastWidth = null;
+
+  function localPoint(clientX, clientY) {
+    var rect = canvas.getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  function processPoint(ev) {
+    var pt = localPoint(ev.clientX, ev.clientY);
+    var grown = growCanvasIfNeeded(pt.x, pt.y);
+    if (grown.dx || grown.dy) {
+      pt = localPoint(ev.clientX, ev.clientY); // canvas moved on screen, recompute
+      if (lastPoint) {
+        lastPoint.x += grown.dx;
+        lastPoint.y += grown.dy;
+      }
+    }
+
+    var width = computeWidth(ev);
+
+    if (lastPoint) {
+      drawSegment(lastPoint.x, lastPoint.y, pt.x, pt.y, (lastWidth + width) / 2);
+    } else {
+      drawDot(pt.x, pt.y, width);
+    }
+
+    lastPoint = pt;
+    lastWidth = width;
+  }
+
+  function endStroke() {
+    currentPointerId = null;
+    currentPointerType = null;
+    lastPoint = null;
+    lastWidth = null;
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    // Palm rejection: while a pen is active, ignore concurrent touch input.
+    if (e.pointerType === 'touch' && penActive) {
+      e.preventDefault();
+      return;
+    }
+
+    if (e.pointerType === 'pen') {
+      penActive = true;
+      // A palm/finger may have started a touch stroke just before the pen
+      // touched down; cancel it so it doesn't leave a stray mark.
+      if (currentPointerType === 'touch') {
+        endStroke();
+      }
+    }
+
+    // Ignore a second simultaneous drawing pointer (e.g. a second finger).
+    if (currentPointerId !== null) return;
+
+    e.preventDefault();
+    currentPointerId = e.pointerId;
+    currentPointerType = e.pointerType;
+    canvas.setPointerCapture(e.pointerId);
+
+    lastPoint = null;
+    lastWidth = null;
+    processPoint(e);
+  });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (e.pointerId !== currentPointerId) return;
+    if (e.pointerType === 'touch' && penActive) return;
+
+    var events = (typeof e.getCoalescedEvents === 'function') ? e.getCoalescedEvents() : [e];
+    if (!events || events.length === 0) events = [e];
+    for (var i = 0; i < events.length; i++) processPoint(events[i]);
+  });
+
+  function onPointerEnd(e) {
+    if (e.pointerType === 'pen') penActive = false;
+    if (e.pointerId !== currentPointerId) return;
+    endStroke();
+  }
+
+  canvas.addEventListener('pointerup', onPointerEnd);
+  canvas.addEventListener('pointercancel', onPointerEnd);
+  canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  // ---- Toolbar -----------------------------------------------------------
+  clearBtn.addEventListener('click', function () {
+    ctx.clearRect(0, 0, logicalWidth, logicalHeight);
+  });
+
+})();
+</script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('service-worker.js');
+  }
+</script>
+
+</body>
+</html>
